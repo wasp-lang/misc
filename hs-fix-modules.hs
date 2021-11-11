@@ -4,18 +4,20 @@
                  filepath ^>= 1.4.2.1,
                  regex-tdfa ^>= 1.3.0.0,
                  text ^>= 1.2.0.0,
-                 strict ^>= 0.4.0.0
+                 strict ^>= 0.4.0.0,
+                 strong-path
 -}
 {-# LANGUAGE ScopedTypeVariables #-}
 
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, mapM, when)
 import Data.Bifunctor (second)
 import Data.List (intercalate, isSuffixOf)
 import Data.Maybe (fromMaybe)
 import Debug.Trace (trace)
+import StrongPath (Abs, Dir, Dir', File, Path', Rel, Rel', fromAbsDir, fromAbsFile, fromRelFile, parseAbsDir, parseRelFile, (</>))
 import System.Directory.Recursive (getFilesRecursive)
 import System.Environment (getArgs)
-import System.FilePath (pathSeparator, splitPath, stripExtension, (</>))
+import System.FilePath (pathSeparator, splitPath, stripExtension)
 import qualified System.IO.Strict
 import qualified Text.Regex.TDFA as TR
 
@@ -34,8 +36,6 @@ import qualified Text.Regex.TDFA as TR
 -- in @src/@ with `Foo`, so you create a directory Foo in there and move everything into it -> updating all the files manually to have correct module names
 -- and correct imports is very tedious, so this is where this script comes in handy.
 
--- TODO: Rewrite whole script to use StrongPath.
-
 -- TODO: Right now, script does not update calls to qualified imports.
 --   So if we have `import qualified A.B` and there is `A.B.Something` in the code,
 --   once we update the import to be `import qualified C.D`, the `A.B.Something` will not be updated, causing a compiler error.
@@ -52,34 +52,34 @@ import qualified Text.Regex.TDFA as TR
 --     2. For each file: read it, check it any of its imports uses any of the old names, replace them with the corresponding new names,
 --        then write the file.
 
+-- TODO: Idea: We could have the script obtain source directories from .cabal file, instead of them being provided manually.
+
 main :: IO ()
 main = do
   args <- getArgs
-  let dirs = args
+  dirs <- mapM parseAbsDir args
 
-  (filesPerDir :: FilesPerDir) <- mapM getRelFilePathsInDir dirs
-  let (hsFilesPerDir :: FilesPerDir) = map (second (filter isHaskellFile)) filesPerDir
+  hsFilesPerDir <- zip dirs <$> mapM getHsFilesInDir dirs
 
   forM_ hsFilesPerDir $ \(dir, files) ->
     forM_ files (fixFileModuleName hsFilesPerDir dir)
 
   putStrLn "Done!"
 
-type FilesPerDir = [(FilePath, [FilePath])]
-
-fixFileModuleName :: FilesPerDir -> FilePath -> FilePath -> IO ()
+fixFileModuleName :: [(Path' Abs Dir', [Path' Rel' (File HsFile)])] -> Path' Abs (Dir d) -> Path' (Rel d) (File HsFile) -> IO ()
 fixFileModuleName hsFilesPerDir absDir relFile = do
   let absFile = absDir </> relFile
+      absFileFP = fromAbsFile absFile
   let expectedModuleName = getExpectedModuleNameFromHsFileRelPath relFile
-  source <- System.IO.Strict.readFile absFile
+  source <- System.IO.Strict.readFile absFileFP
 
   case updateModuleName expectedModuleName source of
-    Nothing -> putStrLn $ "WARNING: Couldn't find 'module' statement in file " ++ absFile ++ ". Skipping!"
+    Nothing -> putStrLn $ "WARNING: Couldn't find 'module' statement in file " ++ absFileFP ++ ". Skipping!"
     Just (newSrc, currentModuleName) ->
       when (currentModuleName /= expectedModuleName) $ do
-        putStrLn $ "In file " ++ absFile ++ ":"
+        putStrLn $ "In file " ++ absFileFP ++ ":"
         putStr $ "  Module name is " ++ currentModuleName ++ " but it should be " ++ expectedModuleName
-        writeFile absFile newSrc
+        writeFile absFileFP newSrc
         putStrLn " -> Updated!"
         putStrLn "  Updating imports in all the files:"
         forM_ hsFilesPerDir $ \(dir, files) ->
@@ -101,20 +101,22 @@ fixFileModuleName hsFilesPerDir absDir relFile = do
                   newSrc = beforeMatch ++ head submatches ++ newModuleName ++ afterMatch
                in Just (newSrc, currentModuleName)
 
-getExpectedModuleNameFromHsFileRelPath :: FilePath -> String
+getExpectedModuleNameFromHsFileRelPath :: Path' (Rel d) (File HsFile) -> String
 getExpectedModuleNameFromHsFileRelPath path =
-  let pathWithNoExt = fromMaybe (error $ "file " ++ path ++ " does not end with .hs") $ stripExtension "hs" path
+  let pathFP = fromRelFile path
+      pathWithNoExt = fromMaybe (error $ "file " ++ pathFP ++ " does not end with .hs") $ stripExtension "hs" pathFP
       pathParts = map (stripStartingSlashes . stripEndingSlashes) $ splitPath pathWithNoExt
    in intercalate "." pathParts
 
-updateFileImportsForRenamedModule :: String -> String -> FilePath -> FilePath -> IO ()
+updateFileImportsForRenamedModule :: String -> String -> Path' Abs (Dir d) -> Path' (Rel d) (File HsFile) -> IO ()
 updateFileImportsForRenamedModule oldModuleName newModuleName absDir relFile = do
   let absFile = absDir </> relFile
-  source <- System.IO.Strict.readFile absFile
+  let absFileFP = fromAbsFile absFile
+  source <- System.IO.Strict.readFile absFileFP
   let newSource = updateQualifiedImport $ updateRegularImport source
   when (newSource /= source) $ do
-    putStr $ "    Updating imports in file " ++ absFile
-    writeFile absFile newSource
+    putStr $ "    Updating imports in file " ++ absFileFP
+    writeFile absFileFP newSource
     putStrLn " -> Updated!"
   where
     -- Given current source, it returns new source that has imports statements updated.
@@ -137,14 +139,17 @@ updateFileImportsForRenamedModule oldModuleName newModuleName absDir relFile = d
     updateRegularImport = updateImport False
     updateQualifiedImport = updateImport True
 
--- | Returns (abs path to dir with no ending slash, [relative paths to files with no starting slashes]).
-getRelFilePathsInDir :: FilePath -> IO (FilePath, [FilePath])
+data HsFile
+
+getHsFilesInDir :: Path' Abs (Dir d) -> IO [Path' (Rel d) (File HsFile)]
+getHsFilesInDir absDirPath = filter (isHaskellFile . fromRelFile) <$> getRelFilePathsInDir absDirPath
+
+getRelFilePathsInDir :: Path' Abs (Dir d) -> IO [Path' (Rel d) (File f)]
 getRelFilePathsInDir absDirPath = do
-  absFilePaths <- getFilesRecursive absDirPath
-  return
-    ( stripEndingSlashes absDirPath,
-      map (stripStartingSlashes . drop (length absDirPath)) absFilePaths
-    )
+  absFilePaths <- getFilesRecursive $ fromAbsDir absDirPath
+  -- TODO: Use `stripProperPrefix` once strong-path implements it.
+  let relFilePaths = map (stripStartingSlashes . drop (length $ fromAbsDir absDirPath)) absFilePaths
+  mapM parseRelFile relFilePaths
 
 stripStartingSlashes :: FilePath -> FilePath
 stripStartingSlashes (c : cs) | c == pathSeparator = stripStartingSlashes cs
