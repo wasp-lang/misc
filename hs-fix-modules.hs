@@ -19,6 +19,21 @@ import System.FilePath (pathSeparator, splitPath, stripExtension, (</>))
 import qualified System.IO.Strict
 import qualified Text.Regex.TDFA as TR
 
+-- | Run this script with @cabal run hs-fix-modules.hs [absolute_directory_paths]@, e.g. @cabal run hs-fix-modules.hs /my-hs-project/src /my-hs-project/test@`.
+-- Arguments are absolute paths to directories containing the source code of your project, from which module trees start.
+--
+-- Script will then go through all the .hs files in those dirs and check for each of them if their Module name matches their file path.
+-- E.g. if we ran @cabal run hs-fix-modules.hs /my-hs-project/src /my-hs-project/test@ and there is a file @/my-hs-project/src/Foo/Bar.hs@ that
+-- has module name defined as `module Foo.Bar`, script will do nothing, as it matches its path in the @src/@ directory.
+-- However if its module was instead defined as `module Bar` or `module Bar.Foo` or smth else, script would detect that this is not as it should be.
+-- When the difference is detected, script updates the file to have the module name dictate by path (in this case `Foo.Bar`) and then also
+-- checks all the other files looking for imports using the old module name and then replaces those with the new module name.
+-- It doesn't update re-exports of modules or qualified calls though, that you need to do manually.
+--
+-- The main use case for using this script is when you want to do some bigger moving of code around, for example you want to prefix all your files
+-- in @src/@ with `Foo`, so you create a directory Foo in there and move everything into it -> updating all the files manually to have correct module names
+-- and correct imports is very tedious, so this is where this script comes in handy.
+
 -- TODO: Rewrite whole script to use StrongPath.
 
 -- TODO: Right now, script does not update calls to qualified imports.
@@ -26,6 +41,16 @@ import qualified Text.Regex.TDFA as TR
 --   once we update the import to be `import qualified C.D`, the `A.B.Something` will not be updated, causing a compiler error.
 
 -- TODO: Right now re-exported module statements (`module A.B` in (..) where) are not updated.
+
+-- TODO: We could be much more efficient. Right now, for each file that has wrong module name, we read all the other files
+--   in order to figure out if they need to be updated regarding imports, bringing us to O(N^2) complexity where N is number of files.
+--   We could bring this down to O(N), ensuring that every file is read/written only once (max twice), by splitting the work
+--   into two phases:
+--     1. For each file: read it, check if module name needs to be updated: if yes, update it now (write file),
+--        and remember for later pair (old name, new name).
+--        Once done with this stage, we have a list of (old name, new name) pairs.
+--     2. For each file: read it, check it any of its imports uses any of the old names, replace them with the corresponding new names,
+--        then write the file.
 
 main :: IO ()
 main = do
