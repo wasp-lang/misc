@@ -67,46 +67,45 @@ main = do
 
 type FilesPerDir = [(FilePath, [FilePath])]
 
--- | Returns (abs path to dir with no ending slash, [relative paths to files with no starting slashes]).
-getRelFilePathsInDir :: FilePath -> IO (FilePath, [FilePath])
-getRelFilePathsInDir absDirPath = do
-  absFilePaths <- getFilesRecursive absDirPath
-  return
-    ( stripEndingSlashes absDirPath,
-      map (stripStartingSlashes . drop (length absDirPath)) absFilePaths
-    )
-
-stripStartingSlashes :: FilePath -> FilePath
-stripStartingSlashes (c : cs) | c == pathSeparator = stripStartingSlashes cs
-stripStartingSlashes path = path
-
-stripEndingSlashes :: FilePath -> FilePath
-stripEndingSlashes = reverse . stripStartingSlashes . reverse
-
-isHaskellFile :: FilePath -> Bool
-isHaskellFile path = ".hs" `isSuffixOf` path
-
 fixFileModuleName :: FilesPerDir -> FilePath -> FilePath -> IO ()
 fixFileModuleName hsFilesPerDir absDir relFile = do
   let absFile = absDir </> relFile
   let expectedModuleName = getExpectedModuleNameFromHsFileRelPath relFile
   source <- System.IO.Strict.readFile absFile
 
-  let (beforeMatch, match, afterMatch, submatches) =
-        source TR.=~ ("\\b(module +)([A-Z][a-zA-Z0-9]*(\\.[A-Z][a-zA-Z0-9]*)*)" :: String) ::
-          (String, String, String, [String])
-  if null match
-    then putStrLn $ "WARNING: Couldn't find 'module' statement in file " ++ absFile ++ ". Skipping!"
-    else do
-      let currentModuleName = submatches !! 1
+  case updateModuleName expectedModuleName source of
+    Nothing -> putStrLn $ "WARNING: Couldn't find 'module' statement in file " ++ absFile ++ ". Skipping!"
+    Just (newSrc, currentModuleName) ->
       when (currentModuleName /= expectedModuleName) $ do
         putStrLn $ "In file " ++ absFile ++ ":"
         putStr $ "  Module name is " ++ currentModuleName ++ " but it should be " ++ expectedModuleName
-        writeFile absFile $ beforeMatch ++ head submatches ++ expectedModuleName ++ afterMatch
+        writeFile absFile newSrc
         putStrLn " -> Updated!"
         putStrLn "  Updating imports in all the files:"
         forM_ hsFilesPerDir $ \(dir, files) ->
           forM_ files (updateFileImportsForRenamedModule currentModuleName expectedModuleName dir)
+  where
+    -- Given new module name that we want to update the module to and its current source,
+    -- returns new updated source and the module name it had before that.
+    -- If it already had the expected/new name, returned pair will be the same as inputs.
+    -- Returns Nothing if given source does not have `module ...` statement.
+    updateModuleName :: String -> String -> Maybe (String, String)
+    updateModuleName newModuleName currentSrc =
+      let regex = "\\b(module +)([A-Z][a-zA-Z0-9]*(\\.[A-Z][a-zA-Z0-9]*)*)"
+          (beforeMatch, match, afterMatch, submatches) =
+            currentSrc TR.=~ (regex :: String) :: (String, String, String, [String])
+       in if null match
+            then Nothing
+            else
+              let currentModuleName = submatches !! 1
+                  newSrc = beforeMatch ++ head submatches ++ newModuleName ++ afterMatch
+               in Just (newSrc, currentModuleName)
+
+getExpectedModuleNameFromHsFileRelPath :: FilePath -> String
+getExpectedModuleNameFromHsFileRelPath path =
+  let pathWithNoExt = fromMaybe (error $ "file " ++ path ++ " does not end with .hs") $ stripExtension "hs" path
+      pathParts = map (stripStartingSlashes . stripEndingSlashes) $ splitPath pathWithNoExt
+   in intercalate "." pathParts
 
 updateFileImportsForRenamedModule :: String -> String -> FilePath -> FilePath -> IO ()
 updateFileImportsForRenamedModule oldModuleName newModuleName absDir relFile = do
@@ -118,6 +117,7 @@ updateFileImportsForRenamedModule oldModuleName newModuleName absDir relFile = d
     writeFile absFile newSource
     putStrLn " -> Updated!"
   where
+    -- Given current source, it returns new source that has imports statements updated.
     updateImport :: Bool -> String -> String
     updateImport isQualified src =
       let regex =
@@ -137,11 +137,24 @@ updateFileImportsForRenamedModule oldModuleName newModuleName absDir relFile = d
     updateRegularImport = updateImport False
     updateQualifiedImport = updateImport True
 
-getExpectedModuleNameFromHsFileRelPath :: FilePath -> String
-getExpectedModuleNameFromHsFileRelPath path =
-  let pathWithNoExt = fromMaybe (error $ "file " ++ path ++ " does not end with .hs") $ stripExtension "hs" path
-      pathParts = map (stripStartingSlashes . stripEndingSlashes) $ splitPath pathWithNoExt
-   in intercalate "." pathParts
+-- | Returns (abs path to dir with no ending slash, [relative paths to files with no starting slashes]).
+getRelFilePathsInDir :: FilePath -> IO (FilePath, [FilePath])
+getRelFilePathsInDir absDirPath = do
+  absFilePaths <- getFilesRecursive absDirPath
+  return
+    ( stripEndingSlashes absDirPath,
+      map (stripStartingSlashes . drop (length absDirPath)) absFilePaths
+    )
+
+stripStartingSlashes :: FilePath -> FilePath
+stripStartingSlashes (c : cs) | c == pathSeparator = stripStartingSlashes cs
+stripStartingSlashes path = path
+
+stripEndingSlashes :: FilePath -> FilePath
+stripEndingSlashes = reverse . stripStartingSlashes . reverse
+
+isHaskellFile :: FilePath -> Bool
+isHaskellFile path = ".hs" `isSuffixOf` path
 
 escapeDots :: String -> String
 escapeDots (c : cs) | c == '.' = '\\' : '.' : escapeDots cs
